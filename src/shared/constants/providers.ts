@@ -23,6 +23,15 @@ import {
 } from "../utils/providerCredentialRequirement";
 
 export const FREE_PROVIDERS = {};
+/** Reuses account cards across capability categories. */
+export const DECISION_PROVIDER_IDS = new Set([
+  "supersoniclabs",
+  "ollama-cloud",
+  "openai",
+  "openrouter",
+  "cloudflare-ai",
+  "orcarouter",
+]);
 
 // No-auth Providers
 

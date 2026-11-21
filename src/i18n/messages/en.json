@@ -2912,7 +2912,8 @@
       "webFetch": "Web Fetch",
       "video": "Video",
       "music": "Music",
-      "ocr": "OCR"
+      "ocr": "OCR",
+      "decisions": "Decisions"
     },
     "noProviders": "No providers configured for this kind yet.",
     "addConnection": "Add Connection",
@@ -7574,6 +7575,9 @@
     "doctorChecking": "Checking status…",
     "doctorCheck": "Check doctor status",
     "fallbackRetryBackendTitle": "Fallback retry backend",
+    "decisionProvidersHeading": "Decision Models",
+    "decisionProvidersDesc": "Native typed decisions through existing provider accounts. Configure the supported decision endpoint and verify model availability.",
+    "categoryDecisions": "Decisions",
     "customJsonApi": "Custom JSON API",
     "customJsonMethodLabel": "HTTP method",
     "customJsonAuthTypeLabel": "Authentication",
