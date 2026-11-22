@@ -121,14 +121,12 @@ export const FREE_MODEL_BUDGETS: FreeModelBudget[] = [
   { provider: "cerebras", modelId: "zai-glm-4.7", displayName: "GLM 4.7", monthlyTokens: 0, creditTokens: 0, freeType: "one-time-initial", poolKey: "cerebras", tos: "caution" },
   { provider: "cerebras", modelId: "gpt-oss-120b", displayName: "GPT OSS 120B", monthlyTokens: 0, creditTokens: 0, freeType: "one-time-initial", poolKey: "cerebras", tos: "caution" },
   // #8717: drop dead Workers AI ids (400/403/410). Keep Neurons/day budget on fp8-fast.
+  // #21007: deepseek-r1-distill-qwen-32b, llama-3.2-3b-instruct, qwq-32b and kimi-k2.6 retired
+  // on 2026-11-20 (HTTP 410).
   { provider: "cloudflare-ai", modelId: "@cf/mistral/mistral-7b-instruct-v0.2-lora", displayName: "Mistral 7B (🆓)", monthlyTokens: 0, creditTokens: 0, freeType: "recurring-daily", poolKey: "cloudflare-ai", tos: "caution" },
   { provider: "cloudflare-ai", modelId: "@cf/qwen/qwen2.5-coder-32b-instruct", displayName: "Qwen 2.5 Coder 32B (🆓)", monthlyTokens: 0, creditTokens: 0, freeType: "recurring-daily", poolKey: "cloudflare-ai", tos: "caution" },
-  { provider: "cloudflare-ai", modelId: "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", displayName: "DeepSeek R1 Distill 32B (🆓)", monthlyTokens: 0, creditTokens: 0, freeType: "recurring-daily", poolKey: "cloudflare-ai", tos: "caution" },
   { provider: "cloudflare-ai", modelId: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", displayName: "Llama 3.3 70B (FP8 Fast 🆓 ~150 resp/day)", monthlyTokens: 30000000, creditTokens: 0, freeType: "recurring-daily", poolKey: "cloudflare-ai", tos: "caution" },
-  { provider: "cloudflare-ai", modelId: "@cf/meta/llama-3.2-3b-instruct", displayName: "Llama 3.2 3B (🆓)", monthlyTokens: 0, creditTokens: 0, freeType: "recurring-daily", poolKey: "cloudflare-ai", tos: "caution" },
-  { provider: "cloudflare-ai", modelId: "@cf/qwen/qwq-32b", displayName: "QwQ 32B (🆓)", monthlyTokens: 0, creditTokens: 0, freeType: "recurring-daily", poolKey: "cloudflare-ai", tos: "caution" },
   { provider: "cloudflare-ai", modelId: "@cf/zai-org/glm-4.7-flash", displayName: "GLM 4.7 Flash (🆓)", monthlyTokens: 0, creditTokens: 0, freeType: "recurring-daily", poolKey: "cloudflare-ai", tos: "caution" },
-  { provider: "cloudflare-ai", modelId: "@cf/moonshotai/kimi-k2.6", displayName: "Kimi K2.6 (🆓)", monthlyTokens: 0, creditTokens: 0, freeType: "recurring-daily", poolKey: "cloudflare-ai", tos: "caution" },
   { provider: "cloudflare-ai", modelId: "@cf/google/gemma-4-26b-a4b-it", displayName: "Gemma 4 26B (🆓)", monthlyTokens: 0, creditTokens: 0, freeType: "recurring-daily", poolKey: "cloudflare-ai", tos: "caution" },
   { provider: "cohere", modelId: "command-a-reasoning-08-2025", displayName: "Command A Reasoning (Aug 2025)", monthlyTokens: 800000, creditTokens: 0, freeType: "recurring-monthly", poolKey: "cohere", tos: "caution" },
   { provider: "cohere", modelId: "command-a-vision-07-2025", displayName: "Command A Vision (Jul 2025)", monthlyTokens: 800000, creditTokens: 0, freeType: "recurring-monthly", poolKey: "cohere", tos: "caution" },
@@ -197,17 +195,17 @@ export const FREE_MODEL_BUDGETS: FreeModelBudget[] = [
   { provider: "glm-cn", modelId: "glm-4.7-flash", displayName: "GLM-4.7-Flash", monthlyTokens: 0, creditTokens: 0, freeType: "recurring-uncapped", poolKey: "zhipu-flash-free", tos: "ok" },
   { provider: "glm-cn", modelId: "glm-signup-bonus", displayName: "Z.AI — 20M signup bonus", monthlyTokens: 0, creditTokens: 20000000, freeType: "one-time-initial", poolKey: "zhipu-signup", tos: "ok" },
   // evidence: public-page https://console.groq.com/docs/rate-limits (2026-09-02) — "Free Plan Limits":
-  // 200K TPD per model for the five chat models below; "Rate limits apply at the organization level".
+  // 200K TPD per model for the chat models below; "Rate limits apply at the organization level".
   // 200K × 30 = 6M per model; the cap is per model, so each row counts on its own (poolKey null).
   // hardStopGuaranteed: same page — "When you exceed rate limits, our API returns a 429 Too Many Requests";
   // https://console.groq.com/docs/billing-faqs — the Free tier has no payment method on file ("To upgrade
   // from the Free tier to the Developer tier, you'll need to provide a valid payment method").
   // Retired from the free tier (https://console.groq.com/docs/deprecations): llama-4-scout and qwen3-32b
-  // (2026-07-17), llama-3.3-70b-versatile (2026-08-16) — deliberately absent below.
+  // (2026-07-17), llama-3.3-70b-versatile (2026-08-16), qwen3.6-27b (2026-09-14, successor
+  // qwen3.8-27b; #21020) — deliberately absent below.
   { provider: "groq", modelId: "openai/gpt-oss-120b", displayName: "GPT-OSS 120B", monthlyTokens: 6000000, creditTokens: 0, freeType: "recurring-daily", poolKey: null, tos: "caution", hardStopGuaranteed: true },
   { provider: "groq", modelId: "openai/gpt-oss-20b", displayName: "GPT-OSS 20B", monthlyTokens: 6000000, creditTokens: 0, freeType: "recurring-daily", poolKey: null, tos: "caution", hardStopGuaranteed: true },
   { provider: "groq", modelId: "openai/gpt-oss-safeguard-20b", displayName: "GPT-OSS Safeguard 20B", monthlyTokens: 6000000, creditTokens: 0, freeType: "recurring-daily", poolKey: null, tos: "caution", hardStopGuaranteed: true },
-  { provider: "groq", modelId: "qwen/qwen3.6-27b", displayName: "Qwen3.6 27B", monthlyTokens: 6000000, creditTokens: 0, freeType: "recurring-daily", poolKey: null, tos: "caution", hardStopGuaranteed: true },
   { provider: "groq", modelId: "qwen/qwen3.8-27b", displayName: "Qwen3.8 27B", monthlyTokens: 6000000, creditTokens: 0, freeType: "recurring-daily", poolKey: null, tos: "caution", hardStopGuaranteed: true },
   { provider: "huggingchat", modelId: "baidu/ERNIE-4.5-VL-424B-A47B-Base-PT", displayName: "ERNIE 4.5 VL 424B A47B Base PT", monthlyTokens: 500000, creditTokens: 0, freeType: "recurring-monthly", poolKey: "huggingchat", tos: "caution" },
   { provider: "huggingchat", modelId: "CohereLabs/c4ai-command-r7b-12-2024", displayName: "Command R7B 12-2024", monthlyTokens: 500000, creditTokens: 0, freeType: "recurring-monthly", poolKey: "huggingchat", tos: "caution" },
