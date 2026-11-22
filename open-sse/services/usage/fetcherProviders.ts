@@ -37,6 +37,7 @@ export const USAGE_FETCHER_PROVIDERS = [
   "glm-cn",
   "zai",
   "glmt",
+  "sensenova",
   "opencode-go",
   "ollama-cloud",
   "minimax",

@@ -14,6 +14,7 @@ import {
   extractCodeAssistOnboardTierId,
   extractCodeAssistSubscriptionTier,
 } from "./codeAssistSubscription.ts";
+import { hasCompatibleQuotaEndpoint } from "../../src/shared/utils/providerQuotaVisibility.ts";
 import { toDisplayLabel } from "./usage/scalars.ts";
 import { parseResetTime, createQuotaFromUsage } from "./usage/quota.ts";
 import {
@@ -44,12 +45,14 @@ import { getCursorUsage } from "./usage/cursor.ts";
 import { getKimiUsage } from "./usage/kimi.ts";
 import { getCodexUsage } from "./usage/codex.ts";
 import { getClaudeUsage, getClaudePlanLabel } from "./usage/claude.ts";
-import { getKiroUsage, buildKiroUsageResult, discoverKiroProfileArn } from "./usage/kiro.ts";
+import { getKiroUsage } from "./usage/kiro.ts";
 // Re-exported para os testes kiro-* (importam de services/usage).
 export { buildKiroUsageResult, discoverKiroProfileArn } from "./usage/kiro.ts";
 import { getAdobeFireflyUsage } from "./usage/adobeFirefly.ts";
 import { getOpenrouterUsage } from "./usage/openrouter.ts";
 import { getOpenAiCompatibleUsage } from "./usage/openaiCompatible.ts";
+import { getSensenovaUsage } from "./sensenovaQuotaFetcher.ts";
+import { isSensenovaQuotaConnection } from "./usage/sensenovaTokenPlan.ts";
 import { getLlmgatewayUsage } from "./usage/llmgateway.ts";
 import { getLyceumUsage } from "./usage/lyceum.ts";
 import { getOllamaCloudUsage } from "./opencodeOllamaUsage.ts";
@@ -131,11 +134,19 @@ export type { UsageFetcherProvider } from "./usage/fetcherProviders.ts";
  * @param {Object} connection - Provider connection with accessToken
  * @returns {Promise<unknown>} Usage data with quotas
  */
+/** Minted per connection by the compatible-provider factories. */
+function isCompatibleNodeId(provider: unknown): boolean {
+  return (
+    typeof provider === "string" &&
+    (provider.startsWith("openai-compatible-") || provider.startsWith("anthropic-compatible-"))
+  );
+}
+
 export async function getUsageForProvider(
   connection: UsageProviderConnection,
   options: { forceRefresh?: boolean; includePlan?: boolean } = {}
 ) {
-  const { id, provider, accessToken, apiKey, providerSpecificData, projectId, email } = connection;
+  const { id, provider, accessToken, apiKey, providerSpecificData, projectId } = connection;
 
   if (isKimiCodingConnection(connection)) {
     return await getKimiUsage(accessToken, apiKey, providerSpecificData, options);
@@ -150,6 +161,26 @@ export async function getUsageForProvider(
   // itself declares where its quota lives (#13616); without that declaration
   // this returns a message and the sync treats it as "nothing to show", exactly
   // as it did before.
+  // A SenseNova Token Plan connection keeps a console session instead of a
+  // declared endpoint, so it is read by its own fetcher before the generic path.
+  // This covers the builtin `sensenova` provider as well as compatible nodes
+  // pointed at the console host: the helper treats a missing base URL as the
+  // builtin shape, while an explicit base URL decides on the host it names.
+  // The builtin id is dispatched by the switch below, so the registration list and
+  // the switch agree; only compatible nodes declared against the console host need
+  // this earlier check, because their minted ids can never appear in a case label.
+  if (
+    isCompatibleNodeId(provider) &&
+    !hasCompatibleQuotaEndpoint(provider, providerSpecificData) &&
+    isSensenovaQuotaConnection({ provider, providerSpecificData })
+  ) {
+    return await getSensenovaUsage({
+      id,
+      provider,
+      providerSpecificData,
+    });
+  }
+
   if (
     typeof provider === "string" &&
     (provider.startsWith("openai-compatible-") || provider.startsWith("anthropic-compatible-"))
@@ -158,6 +189,13 @@ export async function getUsageForProvider(
   }
 
   switch (provider) {
+    case "sensenova":
+      return await getSensenovaUsage({
+        id,
+        provider,
+        providerSpecificData,
+      });
+
     case "github":
       return await getGitHubUsage(accessToken, providerSpecificData, id || "");
     case "antigravity":
