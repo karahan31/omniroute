@@ -31,6 +31,13 @@ import {
   getCliIntegration,
   listCliIntegrationIds,
 } from "../constants/cliIntegrationManifest";
+import {
+  getManagedCliCommand,
+  getManagedCliRoot,
+  getManagedCliSelection,
+  type ManagedCliSelection,
+} from "./managedCliRuntime";
+import { resolveManagedCliInvocation } from "./managedCliLaunch";
 const VALID_RUNTIME_MODES = new Set(["auto", "host", "container"]);
 const FALSE_VALUES = new Set(["0", "false", "no", "off"]);
 
@@ -429,13 +436,22 @@ const runProcess = (
     env,
     timeoutMs = 3000,
     useShell = shouldUseShellForCommand(command),
+    managedSelection,
   }: {
     env?: Record<string, string | undefined>;
     timeoutMs?: number;
     useShell?: boolean;
+    managedSelection?: ManagedCliSelection;
   } = {}
 ): Promise<any> =>
   new Promise((resolve) => {
+    try {
+      const managed = resolveManagedCliInvocation(command, args, managedSelection);
+      if (managed) ({ command, args, useShell } = managed);
+    } catch {
+      resolve({ ok: false, stdout: "", stderr: "invalid managed CLI executable", exitCode: -1 });
+      return;
+    }
     // Guard: reject commands with shell metacharacters — command comes from
     // server-controlled env vars/config, not HTTP input, but belt-and-suspenders.
     if (/[;&|`$<>\n\r]/.test(command)) {
@@ -609,6 +625,7 @@ const getExpectedParentPaths = (): string[] => {
     validatedProgramFiles,
     validatedProgramFilesX86,
     npmPrefix,
+    getManagedCliRoot(),
   ].filter(Boolean);
 };
 
@@ -632,10 +649,15 @@ const getExtraPaths = () =>
  * Checks npm global prefix, NVM locations, standalone installer paths.
  * Works on all platforms — Windows checks .cmd wrappers, Linux/macOS checks bare names.
  */
-export const getKnownToolPaths = (toolId: string): string[] => {
+export const getKnownToolPaths = (
+  toolId: string,
+  selectedManagedCommand?: string | null
+): string[] => {
   toolId = normalizeCliToolId(toolId);
   const home = os.homedir();
-  const paths: string[] = [];
+  const managedCommand =
+    selectedManagedCommand === undefined ? getManagedCliCommand(toolId) : selectedManagedCommand;
+  const paths: string[] = managedCommand ? [managedCommand] : [];
 
   const npmPrefix = getNpmGlobalPrefix();
   const nvmNodePath = getNvmNodePath();
@@ -987,6 +1009,13 @@ export const checkKnownPath = async (commandPath: string) => {
 
 type KnownPathResult = Awaited<ReturnType<typeof checkKnownPath>>;
 
+function matchManagedCliSelection(
+  matchedPath: string | null,
+  managed: ManagedCliSelection | null
+): ManagedCliSelection | undefined {
+  return managed && matchedPath === managed.installation.command ? managed : undefined;
+}
+
 export const locateCommandCandidate = async (
   commands: string[],
   env: Record<string, string | undefined>,
@@ -1000,8 +1029,10 @@ export const locateCommandCandidate = async (
   // This avoids searching PATH and reduces attack surface
   let bestKnownPathFailure: KnownPathResult | null = null;
   if (toolId) {
+    const managed = getManagedCliSelection(normalizeCliToolId(toolId));
+    const managedCommand = managed?.installation.command ?? null;
     const { match, bestFailure } = await findKnownPathMatch(
-      getKnownToolPaths(toolId),
+      getKnownToolPaths(toolId, managedCommand),
       checkKnownPath
     );
     if (match) {
@@ -1010,6 +1041,7 @@ export const locateCommandCandidate = async (
         installed: true,
         commandPath: match.commandPath,
         reason: match.reason,
+        managed: matchManagedCliSelection(match.commandPath, managed),
       };
     }
     bestKnownPathFailure = bestFailure;
@@ -1051,7 +1083,8 @@ export const locateCommandCandidate = async (
 const checkRunnable = async (
   commandPath: string,
   env: Record<string, string | undefined>,
-  timeoutMs = 4000
+  timeoutMs = 4000,
+  managedSelection?: ManagedCliSelection
 ) => {
   // Minimal environment to prevent credential leakage to potentially malicious binaries
   const minimalEnv: Record<string, string | undefined> = {
@@ -1074,7 +1107,11 @@ const checkRunnable = async (
   }
 
   for (const args of [["--version"], ["-v"]]) {
-    const result = await runProcess(commandPath, args, { env: minimalEnv, timeoutMs });
+    const result = await runProcess(commandPath, args, {
+      env: minimalEnv,
+      timeoutMs,
+      managedSelection,
+    });
     // Validate output: must be non-empty and reasonable length (< 4KB)
     if (result.ok && result.stdout.length > 0 && result.stdout.length < 4096) {
       return { runnable: true, reason: null, version: result.stdout.trim() };
@@ -1237,9 +1274,15 @@ const healthcheckWithFallthrough = async (
   command: string | null | undefined,
   commandPath: string | null | undefined,
   env: Record<string, string | undefined>,
-  healthTimeout: number
+  healthTimeout: number,
+  managedSelection?: ManagedCliSelection
 ) => {
-  let healthcheck = await checkRunnable(commandPath || command || "", env, healthTimeout);
+  let healthcheck = await checkRunnable(
+    commandPath || command || "",
+    env,
+    healthTimeout,
+    managedSelection
+  );
   let resolvedPath = commandPath;
   if (!healthcheck.runnable && command) {
     const alt = await findRunnableAlternate(
@@ -1313,6 +1356,7 @@ export const getCliRuntimeStatus = async (toolId: string) => {
       command,
       commandPath: located.commandPath,
       reason: "not_executable",
+      managed: Boolean(located.managed),
       runtimeMode,
       requiresBinary,
     };
@@ -1322,7 +1366,8 @@ export const getCliRuntimeStatus = async (toolId: string) => {
     command,
     located.commandPath,
     env,
-    Number(tool.healthcheckTimeoutMs || 4000)
+    Number(tool.healthcheckTimeoutMs || 4000),
+    located.managed
   );
   return {
     installed: true,
@@ -1331,6 +1376,7 @@ export const getCliRuntimeStatus = async (toolId: string) => {
     command,
     commandPath: resolvedPath,
     reason: healthcheck.reason,
+    managed: Boolean(located.managed && resolvedPath === located.commandPath),
     runtimeMode,
     requiresBinary,
   };
