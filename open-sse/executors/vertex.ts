@@ -270,6 +270,26 @@ function downgradeUnsupportedVertexClaudeTtl(body: Record<string, unknown>, mode
   if (Array.isArray(tools)) tools.forEach(normalizeBlock);
 }
 
+/**
+ * Newer Vertex AI Gemini chat families reject a request ending on a model turn with:
+ * `400 INVALID_ARGUMENT: Requests ending with a model turn are not supported.`
+ *
+ * Keep this explicit rather than matching every non-Claude model: partner models (MaaS),
+ * image generation models, and older Gemini families (e.g. 2.5) predate or fall outside
+ * this restriction (see #10104).
+ */
+export function isVertexGeminiTrailingTurnRestrictedModel(model: string): boolean {
+  if (isPartnerModel(model)) {
+    return false;
+  }
+  const normalized = model.toLowerCase();
+  const baseModel = normalized.includes("/") ? normalized.split("/").pop() || "" : normalized;
+  if (/(?:^|-)image(?:-|$)/.test(baseModel)) {
+    return false;
+  }
+  return /^gemini-(?:[34](?:\.\d+)?(?:-[a-z0-9-]+)?|pro-agent)$/.test(baseModel);
+}
+
 // Defensive normalizer: target-format resolution for manually-added custom Claude models under
 // "vertex"/"vertex-partner" was observed sending a Gemini-shaped body (contents/parts) to the
 // Anthropic rawPredict endpoint instead of the configured "claude" format, causing a hard
@@ -413,6 +433,44 @@ function synthesizeClaudeSse(response: Record<string, unknown>): string {
 
   return events.map((e) => `event: ${e.event}\ndata: ${JSON.stringify(e.data)}\n\n`).join("");
 }
+/**
+ * Vertex AI (aiplatform.googleapis.com) strictly rejects any request ending on a
+ * model turn with `400 INVALID_ARGUMENT: Requests ending with a model turn are not supported.`
+ *
+ * When an agentic harness emits tool calls followed by contextualized tool results
+ * or when a trailing assistant prefill / turn is present in `contents`, Vertex AI
+ * rejects the entire batch.
+ *
+ * Mirrors the trailing-strip pop-loop in Antigravity (`stripTrailingAntigravityAssistantTurn`, #10104).
+ * Guard: never strip `contents` down to empty — at least one entry is always preserved.
+ */
+interface VertexContentLike {
+  role?: string;
+  parts?: unknown[];
+}
+
+export function stripTrailingVertexModelTurn(
+  request: Record<string, unknown>
+): Record<string, unknown> {
+  const contents = request.contents;
+  if (!Array.isArray(contents) || contents.length === 0) {
+    return request;
+  }
+
+  while (contents.length > 1) {
+    const last = contents[contents.length - 1];
+    if (last && typeof last === "object" && "role" in last) {
+      const typed = last as VertexContentLike;
+      if (typed.role === "model") {
+        contents.pop();
+        continue;
+      }
+    }
+    break;
+  }
+
+  return request;
+}
 
 export class VertexExecutor extends BaseExecutor {
   constructor() {
@@ -471,6 +529,13 @@ export class VertexExecutor extends BaseExecutor {
       // one (the openai→claude request translator copies the client's model field over).
       delete body.model;
       downgradeUnsupportedVertexClaudeTtl(body, model);
+    }
+    if (
+      isVertexGeminiTrailingTurnRestrictedModel(model) &&
+      input.body &&
+      typeof input.body === "object"
+    ) {
+      stripTrailingVertexModelTurn(input.body as Record<string, unknown>);
     }
 
     const result = await super.execute(input);
