@@ -5,9 +5,14 @@ import {
   buildSensenovaQuota,
   fetchSensenovaQuota,
   invalidateSensenovaQuotaCache,
+  __testing as __testingHooks,
+  forgetSensenovaCredential,
   registerSensenovaFetchersForNodes,
   registerSensenovaQuotaFetcher,
   toSensenovaUsage,
+  poolFailureReason,
+  sensenovaQuotaFailureReason,
+  quotaFailureMessage,
   SENSENOVA_CLIENT_ID,
   SENSENOVA_POOL_USAGE_URL,
   SENSENOVA_TOKEN_URL,
@@ -24,9 +29,16 @@ import {
 } from "../../open-sse/services/quotaPreflight.ts";
 import { getMonitorFetcher } from "../../open-sse/services/quotaMonitor.ts";
 import { PROVIDER_SPECIFIC_SECRET_FIELDS } from "../../src/lib/db/providers/providerSpecificDataSecrets.ts";
+import * as dbCore from "../../src/lib/db/core.ts";
 
 const originalFetch = globalThis.fetch;
 const originalProxyResolver = connectionProxyTestOverride.resolveProxyForConnection;
+
+test.after(async () => {
+  // A rotation writes through the real provider row, so this file opens the
+  // database even though its HTTP calls are stubbed; close it before exit.
+  await dbCore.shutdownDbInstance();
+});
 
 // Shape captured from the live console on 2026-11-16: two pools, the dedicated
 // Flash-Lite pool listed second, numbers as decimal strings, reset_at as seconds.
@@ -244,7 +256,10 @@ test("the console request carries the documented shape", async () => {
   const form = new URLSearchParams(tokenCall.body);
   assert.equal(form.get("grant_type"), "refresh_token");
   assert.equal(form.get("refresh_token"), "stored-refresh");
-  assert.equal(form.get("client_id"), SENSENOVA_CLIENT_ID);
+  // Literals on purpose: comparing the request against the constant would pass for
+  // any value, including one the console would reject.
+  assert.equal(form.get("client_id"), "nova");
+  assert.equal(SENSENOVA_CLIENT_ID, "nova");
 
   assert.equal(poolCall.url, SENSENOVA_POOL_USAGE_URL);
   assert.equal(poolCall.method, "GET");
@@ -591,7 +606,214 @@ test("a transient failure is not cached for the full window", async (t) => {
   assert.equal(poolCalls, 2, "past the back-off window the fetcher must try again");
 });
 
-test("invalidation forgets both the cached quota and the rotation memory", async () => {
+test("an unwritten rotation still yields to a row written by another process", () => {
+  const connectionId = `sn-unwritten-${Date.now()}`;
+  invalidateSensenovaQuotaCache(connectionId);
+  __testingHooks.setRotationMemory(connectionId, "rotated-unwritten", "consumed");
+  assert.equal(
+    __testingHooks.newestRefreshToken(connectionId, {
+      [SENSENOVA_PSD_REFRESH_TOKEN]: "consumed",
+    }),
+    "rotated-unwritten",
+    "the row still holds the consumed token, so the memory copy wins"
+  );
+  assert.equal(
+    __testingHooks.newestRefreshToken(connectionId, {
+      [SENSENOVA_PSD_REFRESH_TOKEN]: "other-process",
+    }),
+    "other-process",
+    "a third value in the row is a replacement, not our unlanded write"
+  );
+});
+
+test("a replaced credential does not keep serving a memory-only access token", async () => {
+  const connectionId = `sn-access-memory-${Date.now()}`;
+  invalidateSensenovaQuotaCache(connectionId);
+  const poolAuths: string[] = [];
+
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input) === SENSENOVA_TOKEN_URL) {
+      return jsonResponse({
+        access_token: "new-access",
+        refresh_token: "new-rotated",
+        expires_in: 10800,
+      });
+    }
+    poolAuths.push(new Headers(init?.headers).get("Authorization") ?? "");
+    return jsonResponse(LIVE_PAYLOAD);
+  }) as typeof fetch;
+
+  // This process still holds an access token minted for the previous credential.
+  __testingHooks.setAccessMemory(connectionId, "old-access", Date.now() + 3_600_000, "old-refresh");
+  const connection = {
+    providerSpecificData: { [SENSENOVA_PSD_REFRESH_TOKEN]: "operator-refresh" },
+  };
+
+  assert.ok(await fetchSensenovaQuota(connectionId, connection));
+  assert.deepEqual(poolAuths, ["Bearer new-access"]);
+});
+
+test("a node that declares its own quota endpoint keeps that reading", async () => {
+  const connectionId = `node-declared-${Date.now()}`;
+  invalidateSensenovaQuotaCache(connectionId);
+  const calls: string[] = [];
+
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    calls.push(String(input));
+    if (String(input) === SENSENOVA_TOKEN_URL) {
+      return jsonResponse({
+        access_token: "declared-access",
+        refresh_token: "declared-rotated",
+        expires_in: 10800,
+      });
+    }
+    return jsonResponse(LIVE_PAYLOAD);
+  }) as typeof fetch;
+
+  const { getUsageForProvider } = await import("../../open-sse/services/usage.ts");
+  const usage = (await getUsageForProvider({
+    id: connectionId,
+    provider: "openai-compatible-declared",
+    providerSpecificData: {
+      baseUrl: "https://token.sensenova.cn/v1",
+      // A live console session: without it the console path would bail out before any
+      // request, and the assertion below could not tell the two paths apart.
+      [SENSENOVA_PSD_REFRESH_TOKEN]: "declared-refresh",
+      // The stored shape is a mapping, as the provider-specific-data schema enforces.
+      quotaEndpoint: {
+        url: "https://declared.example/quota",
+        quotas: { credits: { used: "$.data.used", limit: "$.data.limit" } },
+      },
+    },
+  } as never)) as Record<string, unknown>;
+
+  assert.equal(
+    calls.filter((url) => url === SENSENOVA_POOL_USAGE_URL).length,
+    0,
+    "the console must not replace a declared endpoint"
+  );
+  assert.ok(usage);
+});
+
+test("a builtin provider with a console base URL keeps its own reading", async () => {
+  const calls: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    calls.push(String(input));
+    if (String(input) === SENSENOVA_TOKEN_URL) {
+      return jsonResponse({
+        access_token: "builtin-access",
+        refresh_token: "builtin-rotated",
+        expires_in: 10800,
+      });
+    }
+    return jsonResponse(LIVE_PAYLOAD);
+  }) as typeof fetch;
+
+  const { getUsageForProvider } = await import("../../open-sse/services/usage.ts");
+  const usage = (await getUsageForProvider({
+    id: "builtin-with-console-url",
+    provider: "deepseek",
+    // A live session too: without it the captured path would bail out before any
+    // request and the assertion could not tell the two dispatch paths apart.
+    providerSpecificData: {
+      baseUrl: "https://token.sensenova.cn/v1",
+      [SENSENOVA_PSD_REFRESH_TOKEN]: "builtin-refresh",
+    },
+  } as never)) as Record<string, unknown>;
+
+  assert.equal(
+    calls.filter((url) => url === SENSENOVA_POOL_USAGE_URL).length,
+    0,
+    "only compatible node ids may be captured by the console check"
+  );
+  assert.ok(usage);
+});
+
+test("a compatible node pointed at the console host is read by the console fetcher", async () => {
+  const connectionId = `node-console-${Date.now()}`;
+  invalidateSensenovaQuotaCache(connectionId);
+  const poolAuths: string[] = [];
+
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input) === SENSENOVA_TOKEN_URL) {
+      return jsonResponse({
+        access_token: "node-access",
+        refresh_token: "node-rotated",
+        expires_in: 10800,
+      });
+    }
+    poolAuths.push(new Headers(init?.headers).get("Authorization") ?? "");
+    return jsonResponse(LIVE_PAYLOAD);
+  }) as typeof fetch;
+
+  const { getUsageForProvider } = await import("../../open-sse/services/usage.ts");
+  const usage = (await getUsageForProvider({
+    id: connectionId,
+    provider: "openai-compatible-console-node",
+    providerSpecificData: {
+      baseUrl: "https://token.sensenova.cn/v1",
+      [SENSENOVA_PSD_REFRESH_TOKEN]: "node-refresh",
+    },
+  } as never)) as Record<string, unknown>;
+
+  assert.equal(usage.plan, "Free Plan");
+  assert.deepEqual(poolAuths, ["Bearer node-access"]);
+});
+
+test("a caller that omits every credential field does not wipe the rotation", async () => {
+  const connectionId = `sn-partial-caller-${Date.now()}`;
+  invalidateSensenovaQuotaCache(connectionId);
+  const sent: string[] = [];
+
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input) === SENSENOVA_TOKEN_URL) {
+      const body = new URLSearchParams(String(init?.body ?? ""));
+      sent.push(body.get("refresh_token") ?? "");
+      return jsonResponse({
+        access_token: "partial-access",
+        refresh_token: "partial-rotated",
+        expires_in: 10800,
+      });
+    }
+    return jsonResponse(LIVE_PAYLOAD);
+  }) as typeof fetch;
+
+  __testingHooks.setRotationMemory(connectionId, "memory-rotated", "consumed-row-token");
+  // `{ id, provider }` is what the saturation probes pass: no credential fields at all.
+  const quota = await fetchSensenovaQuota(connectionId, {
+    id: connectionId,
+    provider: "sensenova",
+  });
+
+  assert.ok(quota, "the remembered rotation must still read the console");
+  assert.deepEqual(
+    sent,
+    ["memory-rotated"],
+    "an absent field in the caller's object must not be read as a removed credential"
+  );
+});
+
+test("an unreadable row leaves the memory-only session in place", async () => {
+  const connectionId = `sn-unreadable-row-${Date.now()}`;
+  invalidateSensenovaQuotaCache(connectionId);
+  let networkCalls = 0;
+  globalThis.fetch = (async () => {
+    networkCalls += 1;
+    return jsonResponse(LIVE_PAYLOAD);
+  }) as typeof fetch;
+
+  // This process holds a session whose row cannot be read back. Unknown is not
+  // evidence of removal, so the copy must survive: destroying it would strand a
+  // connection whose row write already failed. The removal case is covered against
+  // a real row in the persistence suite.
+  __testingHooks.setAccessMemory(connectionId, "orphan-access", Date.now() + 3_600_000, "removed");
+
+  const quota = await fetchSensenovaQuota(connectionId, { providerSpecificData: {} });
+  assert.ok(quota, "an unreadable row must not destroy the only surviving session");
+  assert.equal(networkCalls, 1, "the memory token must be used instead of an exchange");
+});
+
+test("a credential replacement forgets the cached quota and the rotation memory", async () => {
   const connectionId = `sn-invalidate-${Date.now()}`;
   invalidateSensenovaQuotaCache(connectionId);
   let poolCalls = 0;
@@ -611,13 +833,133 @@ test("invalidation forgets both the cached quota and the rotation memory", async
   await fetchSensenovaQuota(connectionId, connection);
   assert.equal(poolCalls, 1, "second call inside the cache window must not fetch");
 
-  invalidateSensenovaQuotaCache(connectionId);
+  forgetSensenovaCredential(connectionId);
   await fetchSensenovaQuota(connectionId, {
     providerSpecificData: { [SENSENOVA_PSD_REFRESH_TOKEN]: "operator-refresh" },
   });
 
   assert.equal(poolCalls, 2, "invalidation must drop the cached quota");
   assert.deepEqual(seenRefresh, ["first-refresh", "operator-refresh"]);
+});
+
+test("a 429 on the retried pool read keeps the outage window", async () => {
+  const connectionId = `sn-retry-429-${Date.now()}`;
+  invalidateSensenovaQuotaCache(connectionId);
+  let poolReads = 0;
+
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    if (String(input) === SENSENOVA_TOKEN_URL) {
+      return jsonResponse({
+        access_token: "retry-access",
+        refresh_token: "retry-rotated",
+        expires_in: 10800,
+      });
+    }
+    poolReads += 1;
+    // The first read is a revoked token, the retry hits a rate limit.
+    return jsonResponse({ error: "x" }, poolReads === 1 ? 401 : 429);
+  }) as typeof fetch;
+
+  const connection = { providerSpecificData: { [SENSENOVA_PSD_REFRESH_TOKEN]: "retry-refresh" } };
+  assert.equal(await fetchSensenovaQuota(connectionId, connection), null);
+  assert.equal(poolReads, 2, "the retry must run once");
+  assert.match(
+    quotaFailureMessage(sensenovaQuotaFailureReason(connectionId)),
+    /unreachable/,
+    "a 429 on the retry is an outage, not a rejected credential"
+  );
+});
+
+test("a plan-level rejection is reported as such and not retried like an outage", async () => {
+  const connectionId = `sn-denied-${Date.now()}`;
+  invalidateSensenovaQuotaCache(connectionId);
+  let poolCalls = 0;
+
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    if (String(input) === SENSENOVA_TOKEN_URL) {
+      return jsonResponse({
+        access_token: "denied-access",
+        refresh_token: "denied-rotated",
+        expires_in: 10800,
+      });
+    }
+    poolCalls += 1;
+    return jsonResponse({ error: "forbidden" }, 403);
+  }) as typeof fetch;
+
+  const connection = { providerSpecificData: { [SENSENOVA_PSD_REFRESH_TOKEN]: "denied-refresh" } };
+  assert.equal(await fetchSensenovaQuota(connectionId, connection), null);
+  assert.match(
+    quotaFailureMessage(sensenovaQuotaFailureReason(connectionId)),
+    /plan does not allow/
+  );
+
+  // The permission window is minutes, not the 30 s outage window: a minute later the
+  // refused reading is still cached, while an outage would already have retried.
+  await fetchSensenovaQuota(connectionId, connection);
+  assert.equal(poolCalls, 1, "a plan rejection must not be re-read on the outage cadence");
+  const later = Date.now() + 5 * 60_000;
+  const realNow = Date.now;
+  Date.now = () => later;
+  try {
+    await fetchSensenovaQuota(connectionId, connection);
+  } finally {
+    Date.now = realNow;
+  }
+  assert.equal(poolCalls, 1, "the permission window must still hold five minutes later");
+});
+
+test("an account with no pool says so instead of blaming the console", async () => {
+  const connectionId = `sn-empty-${Date.now()}`;
+  invalidateSensenovaQuotaCache(connectionId);
+
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    if (String(input) === SENSENOVA_TOKEN_URL) {
+      return jsonResponse({
+        access_token: "empty-access",
+        refresh_token: "empty-rotated",
+        expires_in: 10800,
+      });
+    }
+    return jsonResponse({ plan: { id: "free" }, pools: [] });
+  }) as typeof fetch;
+
+  const connection = { providerSpecificData: { [SENSENOVA_PSD_REFRESH_TOKEN]: "empty-refresh" } };
+  assert.equal(await fetchSensenovaQuota(connectionId, connection), null);
+  assert.match(quotaFailureMessage(sensenovaQuotaFailureReason(connectionId)), /no allowance/);
+});
+
+test("an exhausted window without a declared limit still reads as exhausted", () => {
+  const quota = buildSensenovaQuota({
+    pools: [
+      {
+        pool_type: "default",
+        window_5h: { used: 100, remaining: 0, reset_at: 4_000_000_000 },
+      },
+    ] as never,
+  } as never);
+
+  assert.ok(quota);
+  assert.equal(quota.used, 100);
+  assert.equal(quota.total, 100);
+  assert.equal(quota.percentUsed, 1);
+  assert.equal(quota.limitReached, true);
+});
+
+test("a window without a declared limit derives one from used and remaining", () => {
+  const quota = buildSensenovaQuota({
+    pools: [
+      {
+        id: "p",
+        pool_type: "default",
+        window_5h: { used: "10", remaining: "90", reset_at: 1794851140 },
+      },
+    ],
+  });
+  assert.ok(quota);
+  assert.equal(quota!.used, 10);
+  assert.equal(quota!.total, 100);
+  assert.equal(quota!.percentUsed, 0.1);
 });
 
 test("buildSensenovaQuota clamps an overrun and tolerates broken numbers", () => {
@@ -1015,4 +1357,61 @@ test("the usage adapter reports both windows with their own counters", () => {
   assert.ok(usage.quotas["5h"].resetAt);
   assert.equal(usage.quotas["7d"].total, 1200000);
   assert.equal(usage.quotas["7d"].used, 600000);
+});
+
+test("a failed second pool read keeps the transient window unless it is an auth rejection", () => {
+  assert.equal(poolFailureReason("unauthorized"), "auth");
+  assert.equal(poolFailureReason("unavailable"), "transient");
+});
+
+test("sensenova is registered where the plugin manifest and free-access gate look", async () => {
+  const { USAGE_FETCHER_PROVIDERS } = await import("../../open-sse/services/usage.ts");
+  assert.ok(
+    USAGE_FETCHER_PROVIDERS.includes("sensenova" as (typeof USAGE_FETCHER_PROVIDERS)[number]),
+    "a provider dispatched by getUsageForProvider must be advertised by the registration list"
+  );
+});
+
+test("an api-key-only connection reports no console usage instead of an outage", async () => {
+  const { getUsageForProvider } = await import("../../open-sse/services/usage.ts");
+  const usage = (await getUsageForProvider({
+    id: "conn-api-key-only",
+    provider: "sensenova",
+    providerSpecificData: { apiKey: "sk-synthetic" },
+  } as never)) as Record<string, unknown>;
+  assert.match(String(usage.message), /Usage API not implemented for sensenova/);
+});
+
+test("the failure message follows the reason that was cached", () => {
+  assert.match(quotaFailureMessage("auth"), /re-enter the account password/);
+  assert.match(quotaFailureMessage("transient"), /unreachable/);
+});
+
+test("the builtin sensenova provider reads its quota through the console session", async () => {
+  const { getUsageForProvider } = await import("../../open-sse/services/usage.ts");
+  const connectionId = `builtin-${Math.random().toString(36).slice(2, 8)}`;
+  const connection = {
+    id: connectionId,
+    provider: "sensenova",
+    apiKey: "sn-test-key",
+    providerSpecificData: { sensenovaRefreshToken: "builtin-refresh" },
+  };
+
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    if (String(input) === SENSENOVA_TOKEN_URL) {
+      return Response.json({
+        access_token: "builtin-access",
+        refresh_token: "builtin-rotated",
+        expires_in: 10800,
+      });
+    }
+    return Response.json(LIVE_PAYLOAD);
+  }) as typeof fetch;
+
+  const usage = (await getUsageForProvider(connection as never)) as Record<string, unknown>;
+  const quotas = usage.quotas as Record<string, { remaining?: number }> | undefined;
+  assert.ok(quotas, `expected a console reading, got ${JSON.stringify(usage)}`);
+  assert.equal(typeof (quotas["5h"] ?? {}).remaining, "number");
+  invalidateSensenovaQuotaCache(connectionId);
+  globalThis.fetch = originalFetch;
 });

@@ -123,4 +123,5 @@ export const USAGE_SUPPORTED_PROVIDERS: readonly string[] = [
   "xkiro",
   // Zed Hosted Models USD credit (optional Orb billing portal link)
   "zed-hosted",
+  "sensenova",
 ];

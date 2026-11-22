@@ -17,7 +17,9 @@ process.env.STORAGE_ENCRYPTION_KEY = "provider-cas-synthetic-key";
 const core = await import("../../src/lib/db/core.ts");
 const providers = await import("../../src/lib/db/providers.ts");
 
-test.after(() => {
+test.after(async () => {
+  // Close the handle first: a live SQLite file cannot be removed on Windows.
+  await core.shutdownDbInstance();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
 });
 

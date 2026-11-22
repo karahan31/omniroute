@@ -14,6 +14,7 @@ import {
   extractCodeAssistOnboardTierId,
   extractCodeAssistSubscriptionTier,
 } from "./codeAssistSubscription.ts";
+import { hasCompatibleQuotaEndpoint } from "../../src/shared/utils/providerQuotaVisibility.ts";
 import { toDisplayLabel } from "./usage/scalars.ts";
 import { parseResetTime, createQuotaFromUsage } from "./usage/quota.ts";
 import {
@@ -133,6 +134,14 @@ export type { UsageFetcherProvider } from "./usage/fetcherProviders.ts";
  * @param {Object} connection - Provider connection with accessToken
  * @returns {Promise<unknown>} Usage data with quotas
  */
+/** Minted per connection by the compatible-provider factories. */
+function isCompatibleNodeId(provider: unknown): boolean {
+  return (
+    typeof provider === "string" &&
+    (provider.startsWith("openai-compatible-") || provider.startsWith("anthropic-compatible-"))
+  );
+}
+
 export async function getUsageForProvider(
   connection: UsageProviderConnection,
   options: { forceRefresh?: boolean; includePlan?: boolean } = {}
@@ -152,11 +161,17 @@ export async function getUsageForProvider(
   // itself declares where its quota lives (#13616); without that declaration
   // this returns a message and the sync treats it as "nothing to show", exactly
   // as it did before.
-  // A SenseNova custom node keeps a console session instead of a declared
-  // endpoint, so it is read by its own fetcher before the generic path below.
+  // A SenseNova Token Plan connection keeps a console session instead of a
+  // declared endpoint, so it is read by its own fetcher before the generic path.
+  // This covers the builtin `sensenova` provider as well as compatible nodes
+  // pointed at the console host: the helper treats a missing base URL as the
+  // builtin shape, while an explicit base URL decides on the host it names.
+  // The builtin id is dispatched by the switch below, so the registration list and
+  // the switch agree; only compatible nodes declared against the console host need
+  // this earlier check, because their minted ids can never appear in a case label.
   if (
-    typeof provider === "string" &&
-    (provider.startsWith("openai-compatible-") || provider.startsWith("anthropic-compatible-")) &&
+    isCompatibleNodeId(provider) &&
+    !hasCompatibleQuotaEndpoint(provider, providerSpecificData) &&
     isSensenovaQuotaConnection({ provider, providerSpecificData })
   ) {
     return await getSensenovaUsage({
@@ -174,6 +189,13 @@ export async function getUsageForProvider(
   }
 
   switch (provider) {
+    case "sensenova":
+      return await getSensenovaUsage({
+        id,
+        provider,
+        providerSpecificData,
+      });
+
     case "github":
       return await getGitHubUsage(accessToken, providerSpecificData, id || "");
     case "antigravity":

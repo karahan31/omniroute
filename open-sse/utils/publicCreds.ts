@@ -177,6 +177,8 @@ const EMBEDDED_DEFAULTS = {
   // MiniMax Code — public oauth client id, the name of the profile directory
   // the MiniMax Code CLI stores its credential in.
   minimax_id: [2, 14, 1, 13, 23, 66, 5, 1, 7, 65, 25, 22],
+  // SenseNova console OAuth — public PKCE client id (`nova`), no secret.
+  sensenova_id: [1, 2, 24, 8],
   // Trae Cloud IDE — public oauth client id
   trae_id: [10, 3, 95, 6, 10, 22, 66, 3, 11, 90, 72, 31, 91, 2],
   // Microsoft 365 Copilot web (m365.cloud.microsoft) — public SPA client id

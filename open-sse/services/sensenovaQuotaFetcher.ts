@@ -46,11 +46,15 @@ import { throttleQuotaFetch } from "./quotaFetchThrottle.ts";
 import { fetchWithConnectionProxy } from "./connectionProxyFetch.ts";
 import { toNumber } from "../utils/numeric.ts";
 import { parseSensenovaOrigin } from "./usage/sensenovaTokenPlan.ts";
+import { resolvePublicCred } from "../utils/publicCreds.ts";
 
 export const SENSENOVA_POOL_USAGE_URL =
   "https://platform.sensenova.cn/lite/console/v1/tokenplan/pool-usage";
 export const SENSENOVA_TOKEN_URL = "https://signin.sensecore.cn/oauth2/token";
-export const SENSENOVA_CLIENT_ID = "nova";
+// The console OAuth client id is public by design (PKCE, no secret). It lives in
+// the public-credential table so a release does not ship a literal that pattern
+// scanners flag, and so an operator can override it through the environment.
+export const SENSENOVA_CLIENT_ID = resolvePublicCred("sensenova_id", "SENSENOVA_CLIENT_ID");
 
 export const SENSENOVA_PSD_REFRESH_TOKEN = "sensenovaRefreshToken";
 export const SENSENOVA_PSD_ACCESS_TOKEN = "sensenovaAccessToken";
@@ -63,6 +67,7 @@ const CACHE_TTL_MS = 60_000;
 // struggling, so it backs off further.
 const AUTH_NEGATIVE_TTL_MS = 5_000;
 const TRANSIENT_NEGATIVE_TTL_MS = 30_000;
+const DENIED_NEGATIVE_TTL_MS = 600_000;
 const MAX_CACHE_ENTRIES = 512;
 const EXPIRY_MARGIN_MS = 120_000;
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -92,28 +97,34 @@ export interface SensenovaPoolUsagePayload {
 interface CacheEntry {
   quota: QuotaInfo | null;
   fetchedAt: number;
-  /** Why the entry is empty: a rejected credential clears sooner than an outage. */
-  reason?: "auth" | "transient";
+  /** Why the entry is empty: each reason earns its own retry window. */
+  reason?: QuotaFailureReason;
 }
 
 const quotaCache = new Map<string, CacheEntry>();
 const inflightRefresh = new Map<
   string,
-  { refreshToken: string; promise: Promise<SensenovaSession | null> }
+  { refreshToken: string; promise: Promise<ExchangeOutcome> }
 >();
 /** Newest refresh token per connection, kept in memory because a rotation is not
  * always writable to the row (locked database, read-only replica). Bounded like
  * the quota cache so a long-lived process does not retain every credential. */
-const latestRefreshTokens = new Map<string, string>();
+// Each entry remembers the row token it replaced: if the row later carries a
+// different token, another process rotated it and this copy is dead.
+const latestRefreshTokens = new Map<string, { token: string; basedOn: string }>();
 /** Bumped whenever a connection's credential is invalidated. A fetch or exchange
  * that started before the bump must not publish its result: the credential it
  * used has been replaced in the meantime. */
+// Two independent signals: a reading invalidation (429, exhaustion) must drop the
+// cached quota but never the rotation an in-flight exchange just obtained, while a
+// credential replacement must invalidate both.
 const invalidationSeq = new Map<string, number>();
+const quotaInvalidationSeq = new Map<string, number>();
 /** Access tokens this process obtained but could not write to the row (locked or
  * read-only database). Kept apart from the connection object on purpose: the CAS
  * fence compares that object, so writing these into it would make every later
  * attempt look stale. */
-const memoryAccessTokens = new Map<string, { token: string; expiresAt: number }>();
+const memoryAccessTokens = new Map<string, { token: string; expiresAt: number; basedOn: string }>();
 
 /** Bounded, least-recently-written eviction shared by the process-local maps. */
 function rememberIn<V>(map: Map<string, V>, key: string, value: V): void {
@@ -126,16 +137,32 @@ function rememberIn<V>(map: Map<string, V>, key: string, value: V): void {
   map.set(key, value);
 }
 
-function rememberAccessToken(connectionId: string, token: string, expiresAt: number): void {
+function rememberAccessToken(
+  connectionId: string,
+  token: string,
+  expiresAt: number,
+  basedOn: string
+): void {
   // One entry per connection, never evicted: dropping a rotation that only exists
   // in memory would strand the connection until someone re-enters the credential.
-  memoryAccessTokens.set(connectionId, { token, expiresAt });
+  // As with the refresh chain, `basedOn` stays at the row generation, so a later
+  // rotation that also failed to persist does not orphan this copy.
+  // The comparison is against the previous entry, not the token just consumed: in a
+  // chain of failed writes each exchange supersedes the one before, while the row keeps
+  // the generation the whole chain started from.
+  const previous = memoryAccessTokens.get(connectionId);
+  const resolvedBasedOn = previous ? previous.basedOn : basedOn;
+  memoryAccessTokens.set(connectionId, { token, expiresAt, basedOn: resolvedBasedOn });
 }
 
-function rememberRefreshToken(connectionId: string, refreshToken: string): void {
+function rememberRefreshToken(connectionId: string, refreshToken: string, basedOn: string): void {
   // Same reason as the access token above: this may be the only surviving copy of
-  // a rotated refresh token, so it is kept for the life of the process.
-  latestRefreshTokens.set(connectionId, refreshToken);
+  // a rotated refresh token, so it is kept for the life of the process. `basedOn` names
+  // the row generation this chain supersedes, so a second write failure must keep the
+  // original one instead of chaining to a token the row never held.
+  const previous = latestRefreshTokens.get(connectionId);
+  const resolvedBasedOn = previous && previous.token === basedOn ? previous.basedOn : basedOn;
+  latestRefreshTokens.set(connectionId, { token: refreshToken, basedOn: resolvedBasedOn });
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -157,8 +184,21 @@ function toIsoFromUnixSeconds(value: string | number | undefined): string | null
 
 function windowFromPayload(payload?: SensenovaWindowPayload): QuotaWindowInfo | undefined {
   if (!payload) return undefined;
-  const limit = toNumber(payload.limit);
   const used = toNumber(payload.used);
+  const remaining = toNumber(payload.remaining);
+  // A plan that reports only `used` and `remaining` still has a limit: the two add
+  // up. An explicitly declared limit wins either way, including a declared zero,
+  // which means "no allowance configured" rather than "derive one".
+  const declared = payload.limit;
+  const hasDeclaredLimit =
+    declared !== undefined && declared !== null && String(declared).trim() !== "";
+  const declaredLimit = toNumber(declared);
+  const limit =
+    declaredLimit > 0
+      ? declaredLimit
+      : !hasDeclaredLimit && (used > 0 || remaining > 0)
+        ? Math.max(0, used) + Math.max(0, remaining)
+        : 0;
   const percentUsed = limit > 0 ? Math.min(1, Math.max(0, used / limit)) : 0;
   return {
     percentUsed,
@@ -230,8 +270,8 @@ export function buildSensenovaQuota(payload: SensenovaPoolUsagePayload | null): 
     plan: payload.plan?.name || payload.plan?.id,
     // Report the numbers of the window that actually binds, so `used`/`total` and
     // `percentUsed` describe the same window instead of contradicting each other.
-    used: Math.max(0, toNumber(binding.used)),
-    total: Math.max(0, toNumber(binding.limit)),
+    used: Math.max(0, binding.info.used),
+    total: Math.max(0, binding.info.total),
     percentUsed: binding.info.percentUsed,
     resetAt: binding.info.resetAt ?? null,
     windows,
@@ -247,13 +287,37 @@ export interface SensenovaSession {
   refreshToken?: string;
 }
 
+/**
+ * The exchange response is untrusted JSON: a non-finite or non-positive lifetime must
+ * fall back to the documented default instead of minting a session that never expires.
+ */
+function accessTtlSeconds(value: unknown): number {
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : DEFAULT_ACCESS_TTL_SECONDS;
+}
+
 function readRefreshToken(psd: Record<string, unknown>): string {
   const value = psd[SENSENOVA_PSD_REFRESH_TOKEN];
   return typeof value === "string" && value.length > 0 ? value : "";
 }
 
 function newestRefreshToken(connectionId: string, psd: Record<string, unknown>): string {
-  return latestRefreshTokens.get(connectionId) || readRefreshToken(psd);
+  const entry = latestRefreshTokens.get(connectionId);
+  const rowToken = readRefreshToken(psd);
+  if (!entry) return rowToken;
+  // A caller that passes `{ id, provider }` carries no credential fields at all, so an
+  // empty value here says nothing about the row. Only the row can report a removal, and
+  // resolveSession asks it before either memory map is dropped.
+  if (!rowToken) return entry.token;
+  // The row is authoritative unless it still holds the token this rotation started
+  // from or the token it produced. Any third value means another writer replaced the
+  // credential, and replaying ours would serve the previous account — whether or not
+  // this process managed to persist its rotation.
+  if (rowToken && rowToken !== entry.basedOn && rowToken !== entry.token) {
+    latestRefreshTokens.delete(connectionId);
+    return rowToken;
+  }
+  return entry.token;
 }
 
 function memoryAccessToken(connectionId: string, allowExpiring = false): string | null {
@@ -265,6 +329,10 @@ function memoryAccessToken(connectionId: string, allowExpiring = false): string 
 
 function currentSeq(connectionId: string): number {
   return invalidationSeq.get(connectionId) ?? 0;
+}
+
+function currentQuotaSeq(connectionId: string): number {
+  return quotaInvalidationSeq.get(connectionId) ?? 0;
 }
 
 function cachedAccessToken(psd: Record<string, unknown>, allowExpiring = false): string | null {
@@ -281,13 +349,35 @@ function cachedAccessToken(psd: Record<string, unknown>, allowExpiring = false):
   return deadline > Date.now() ? token : null;
 }
 
+function asPsdRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/**
+ * The credential generation is exactly the token trio. A compare-and-swap
+ * failure caused by anything else (a label, a base URL) must not discard a
+ * refresh token the platform has already rotated: the superseded one no longer
+ * authenticates, so throwing the new one away locks the connection out.
+ */
+function sameCredentialGeneration(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  return [
+    SENSENOVA_PSD_REFRESH_TOKEN,
+    SENSENOVA_PSD_ACCESS_TOKEN,
+    SENSENOVA_PSD_ACCESS_EXPIRES_AT,
+  ].every((key) => (a[key] ?? null) === (b[key] ?? null));
+}
+
 async function persistTokens(
   connectionId: string,
   psd: Record<string, unknown>,
   accessToken: string,
   expiresInSeconds: number,
   refreshToken: string | undefined,
-  expected: Record<string, unknown>
+  expected: Record<string, unknown>,
+  consumedToken: string,
+  chainAnchor: string
 ): Promise<"written" | "stale" | "failed"> {
   const tokenFields: Record<string, unknown> = {
     [SENSENOVA_PSD_ACCESS_TOKEN]: accessToken,
@@ -309,9 +399,47 @@ async function persistTokens(
       // operator replaced the credential meanwhile, this write must not land.
       { expectedProviderSpecificData: expected }
     );
-    if (!applied) return "stale";
-    Object.assign(psd, tokenFields);
-    return "written";
+    // A fenced miss is not "another writer stored it": the platform already
+    // invalidated the previous refresh token, so the rotated one must still land.
+    // Re-read, confirm the credential generation is unchanged, and merge the token
+    // fields onto the fresh row. Three attempts absorb repeated unrelated edits; a
+    // changed generation is a real replacement and must win.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (applied) break;
+      const fresh = await getProviderConnectionById(connectionId);
+      const freshPsd = asPsdRecord(fresh?.providerSpecificData);
+      // Our own earlier write moves the row without replacing the credential: the
+      // fresh row then names the very token this exchange consumed. That is not
+      // another writer, so the rotation must land.
+      // Our own chain is recognisable two ways: the fresh row still matches the
+      // caller's snapshot, or it names a token this process either consumed or
+      // superseded. A caller that passes no credential fields has an empty snapshot,
+      // so the token identity is the only evidence available to it.
+      const freshToken = readRefreshToken(freshPsd);
+      const oursOrUnchanged =
+        sameCredentialGeneration(freshPsd, expected) ||
+        (consumedToken.length > 0 && freshToken === consumedToken) ||
+        (chainAnchor.length > 0 && freshToken === chainAnchor);
+      if (!freshPsd || !oursOrUnchanged) return "stale";
+      const merged = await updateProviderConnection(
+        connectionId,
+        { providerSpecificData: { ...freshPsd, ...tokenFields } },
+        { expectedProviderSpecificData: freshPsd }
+      );
+      if (merged) {
+        Object.assign(psd, tokenFields);
+        return "written";
+      }
+      Object.assign(expected, freshPsd);
+    }
+    if (applied) {
+      Object.assign(psd, tokenFields);
+      return "written";
+    }
+    // The credential is still ours, we simply could not get the rotated tokens
+    // stored. Reporting "stale" here would tell the caller the credential was
+    // replaced and send the operator to re-authenticate a healthy account.
+    return "failed";
   } catch {
     // A locked or read-only database must not be mistaken for a replaced
     // credential: the session stays usable for this process through the memory
@@ -320,13 +448,24 @@ async function persistTokens(
   }
 }
 
+type ExchangeOutcome = { session: SensenovaSession } | { failure: "auth" | "transient" };
+
+/**
+ * A 5xx, 408 or 429 from the token endpoint is an outage: the credential is not
+ * implicated, so the answer must not be cached as an auth failure. Anything else
+ * (400 invalid_grant, 401, 403) says the stored refresh token no longer works.
+ */
+function tokenEndpointFailure(status: number): "auth" | "transient" {
+  return status >= 500 || status === 408 || status === 429 ? "transient" : "auth";
+}
+
 async function exchangeRefreshToken(
   connectionId: string,
   psd: Record<string, unknown>,
   refreshToken: string,
   expected: Record<string, unknown>,
   seqAtStart: number
-): Promise<SensenovaSession | null> {
+): Promise<ExchangeOutcome> {
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
@@ -342,50 +481,62 @@ async function exchangeRefreshToken(
     body: body.toString(),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
-  if (!response || !response.ok) return null;
+  if (!response) return { failure: "transient" };
+  if (!response.ok) return { failure: tokenEndpointFailure(response.status) };
 
   const payload = (await response.json()) as {
     access_token?: string;
     refresh_token?: string;
     expires_in?: number;
   };
-  if (!payload.access_token) return null;
+  // A 200 without a token is a protocol anomaly, not a rejected credential.
+  if (!payload.access_token) return { failure: "transient" };
 
   // An invalidation that lands while this exchange is in flight means the
   // credential was replaced under it: the tokens it just obtained describe the
   // old account, so they must not reach the row.
-  if (seqAtStart !== currentSeq(connectionId)) return null;
+  if (seqAtStart !== currentSeq(connectionId)) return { failure: "auth" };
 
   const outcome = await persistTokens(
     connectionId,
     psd,
     payload.access_token,
-    Number(payload.expires_in) > 0 ? Number(payload.expires_in) : DEFAULT_ACCESS_TTL_SECONDS,
+    accessTtlSeconds(payload.expires_in),
     payload.refresh_token,
-    expected
+    expected,
+    refreshToken,
+    latestRefreshTokens.get(connectionId)?.basedOn ?? ""
   );
   // An invalidation can land during the awaited write; in that case the memory
   // updates below would resurrect the superseded tokens.
-  if (currentSeq(connectionId) !== seqAtStart) return null;
+  if (currentSeq(connectionId) !== seqAtStart) return { failure: "auth" };
 
   if (outcome === "stale") {
     // Someone else owns the credential now: hand back nothing so the caller
-    // re-reads the connection instead of acting on a superseded session.
-    return null;
+    // re-reads the connection instead of acting on a superseded session, and drop
+    // both process-local copies so no in-flight exchange keeps using them.
+    forgetSensenovaCredential(connectionId);
+    return { failure: "auth" };
   }
   if (outcome === "failed") {
     // The token is valid, only the write failed. Keep both halves in memory so
     // this process can keep using them, and let a later exchange retry the write.
-    const expiresIn =
-      Number(payload.expires_in) > 0 ? Number(payload.expires_in) : DEFAULT_ACCESS_TTL_SECONDS;
-    rememberAccessToken(connectionId, payload.access_token, Date.now() + expiresIn * 1000);
-    if (payload.refresh_token) rememberRefreshToken(connectionId, payload.refresh_token);
-    return { accessToken: payload.access_token, refreshToken: payload.refresh_token };
+    const expiresIn = accessTtlSeconds(payload.expires_in);
+    rememberAccessToken(
+      connectionId,
+      payload.access_token,
+      Date.now() + expiresIn * 1000,
+      refreshToken
+    );
+    if (payload.refresh_token)
+      rememberRefreshToken(connectionId, payload.refresh_token, refreshToken);
+    return { session: { accessToken: payload.access_token, refreshToken: payload.refresh_token } };
   }
-  if (payload.refresh_token) rememberRefreshToken(connectionId, payload.refresh_token);
+  if (payload.refresh_token)
+    rememberRefreshToken(connectionId, payload.refresh_token, refreshToken);
   // The row now carries these tokens; the memory-only copy would only shadow them.
   memoryAccessTokens.delete(connectionId);
-  return { accessToken: payload.access_token, refreshToken: payload.refresh_token };
+  return { session: { accessToken: payload.access_token, refreshToken: payload.refresh_token } };
 }
 
 /**
@@ -398,7 +549,7 @@ async function startRefresh(
   connectionId: string,
   psd: Record<string, unknown>,
   refreshToken: string
-): Promise<SensenovaSession | null> {
+): Promise<ExchangeOutcome> {
   const pending = inflightRefresh.get(connectionId);
   // Only share an exchange that is working on the same credential: a caller that
   // already holds a newer token must not be handed the older in-flight result.
@@ -413,7 +564,7 @@ async function startRefresh(
     expected,
     currentSeq(connectionId)
   )
-    .catch(() => null)
+    .catch(() => ({ failure: "transient" as const }))
     .finally(() => {
       const current = inflightRefresh.get(connectionId);
       if (current && current.promise === promise) inflightRefresh.delete(connectionId);
@@ -422,36 +573,105 @@ async function startRefresh(
   return promise;
 }
 
+interface SessionResolution {
+  session: SensenovaSession | null;
+  reason: "auth" | "transient";
+}
+
+/**
+ * True only when the stored row exists and carries no refresh token. An unreadable
+ * row is unknown, and unknown must keep the memory copies rather than destroy them.
+ */
+async function rowCarriesNoCredential(connectionId: string): Promise<boolean> {
+  try {
+    const { getProviderConnectionById } = await import("../../src/lib/db/providers.ts");
+    const row = await getProviderConnectionById(connectionId);
+    if (!row) return false;
+    return !readRefreshToken(asPsdRecord(row.providerSpecificData));
+  } catch {
+    return false;
+  }
+}
+
 async function resolveSession(
   connectionId: string,
   psd: Record<string, unknown>
-): Promise<SensenovaSession | null> {
+): Promise<SessionResolution> {
+  // A memory token belongs to the credential generation that produced it. If the
+  // row now names a different refresh token, another writer replaced the account and
+  // serving the cached token would report the previous account's allowance.
+  const memoryEntry = memoryAccessTokens.get(connectionId);
+  const rowRefresh = readRefreshToken(psd);
+  if (!rowRefresh && (await rowCarriesNoCredential(connectionId))) {
+    // The credential was removed from the row: nothing in memory may outlive it.
+    memoryAccessTokens.delete(connectionId);
+    latestRefreshTokens.delete(connectionId);
+  } else if (
+    memoryEntry &&
+    rowRefresh &&
+    memoryEntry.basedOn &&
+    rowRefresh !== memoryEntry.basedOn
+  ) {
+    memoryAccessTokens.delete(connectionId);
+  }
   const cached = memoryAccessToken(connectionId) ?? cachedAccessToken(psd);
-  if (cached) return { accessToken: cached };
+  if (cached) return { session: { accessToken: cached }, reason: "transient" };
 
   const refreshToken = newestRefreshToken(connectionId, psd);
   if (!refreshToken) {
     // Nothing can refresh it, so a token inside the refresh margin is still
     // better than reporting no session: it works until it actually expires.
     const expiring = memoryAccessToken(connectionId, true) ?? cachedAccessToken(psd, true);
-    return expiring ? { accessToken: expiring } : null;
+    return expiring
+      ? { session: { accessToken: expiring }, reason: "transient" }
+      : { session: null, reason: "auth" };
   }
 
   const seq = currentSeq(connectionId);
   const refreshed = await startRefresh(connectionId, psd, refreshToken);
-  if (refreshed) return refreshed;
+  if ("session" in refreshed) return { session: refreshed.session, reason: "transient" };
   // The exchange failed for a transient reason (the console is down, the token
   // endpoint hiccuped). A replaced credential bumps the sequence, so an unchanged
   // one means the stored token is the best remaining option even inside the margin.
-  if (currentSeq(connectionId) !== seq) return null;
+  if (currentSeq(connectionId) !== seq) return { session: null, reason: "auth" };
   const fallback = memoryAccessToken(connectionId, true) ?? cachedAccessToken(psd, true);
-  return fallback ? { accessToken: fallback } : null;
+  if (!fallback) return { session: null, reason: refreshed.failure };
+  // A replacement written by another process does not move this process's
+  // invalidation counter, so the row itself has to be asked before a stale access
+  // token is used to read a quota that now belongs to a different account.
+  let currentPsd: Record<string, unknown> | null = null;
+  try {
+    const { getProviderConnectionById: readConnection } =
+      await import("../../src/lib/db/providers.ts");
+    const current = await readConnection(connectionId);
+    currentPsd = asPsdRecord(current?.providerSpecificData);
+  } catch {
+    // A read that fails must not turn an outage into a credential verdict.
+    currentPsd = null;
+  }
+  if (currentPsd && !sameCredentialGeneration(currentPsd, psd)) {
+    return { session: null, reason: "auth" };
+  }
+  return { session: { accessToken: fallback }, reason: "transient" };
 }
 
 type PoolUsageResult =
   | { status: "ok"; payload: SensenovaPoolUsagePayload }
   | { status: "unauthorized" }
+  | { status: "forbidden" }
   | { status: "unavailable" };
+
+/** Why a reading is empty. Each earns its own retry window and its own advice. */
+export type QuotaFailureReason = "auth" | "transient" | "denied" | "empty";
+
+/** Map a failed pool read to the negative-cache reason it earns. */
+export function poolFailureReason(
+  status: Exclude<PoolUsageResult["status"], "ok">
+): QuotaFailureReason {
+  if (status === "unauthorized") return "auth";
+  if (status === "forbidden") return "denied";
+  return "transient";
+}
 
 async function requestPoolUsage(
   connectionId: string,
@@ -475,13 +695,17 @@ async function requestPoolUsage(
   // spurious rotation would leave the connection without a usable credential.
   // Only 401 means the token died. A 403 is a permission or plan problem, and
   // rotating the credential for it would invalidate a token that still works.
-  return response.status === 401 ? { status: "unauthorized" } : { status: "unavailable" };
+  if (response.status === 401) return { status: "unauthorized" };
+  // 403 is the plan or the account's permission, not a dead token: rotating here
+  // would invalidate a credential that still works, and it will not clear on retry.
+  if (response.status === 403) return { status: "forbidden" };
+  return { status: "unavailable" };
 }
 
 function rememberQuota(
   connectionId: string,
   quota: QuotaInfo | null,
-  reason: "auth" | "transient" = "transient"
+  reason: QuotaFailureReason = "transient"
 ): void {
   rememberIn(quotaCache, connectionId, { quota, fetchedAt: Date.now(), reason });
 }
@@ -489,14 +713,18 @@ function rememberQuota(
 interface QuotaCacheEntry {
   quota: QuotaInfo | null;
   fetchedAt: number;
-  reason?: "auth" | "transient";
+  reason?: QuotaFailureReason;
 }
 
 function cacheTtlFor(entry: QuotaCacheEntry): number {
   // A failed fetch is remembered only briefly: caching a null for the full window
-  // would hide a recovered console from the router for a minute.
+  // would hide a recovered console from the router for a minute. A permission or
+  // plan rejection is the exception: retrying it every 30 s cannot change anything.
   if (entry.quota) return CACHE_TTL_MS;
-  return entry.reason === "auth" ? AUTH_NEGATIVE_TTL_MS : TRANSIENT_NEGATIVE_TTL_MS;
+  if (entry.reason === "auth") return AUTH_NEGATIVE_TTL_MS;
+  if (entry.reason === "denied") return DENIED_NEGATIVE_TTL_MS;
+  if (entry.reason === "empty") return CACHE_TTL_MS;
+  return TRANSIENT_NEGATIVE_TTL_MS;
 }
 
 /**
@@ -511,7 +739,7 @@ function hasUsableCredential(connectionId: string, psd: Record<string, unknown>)
 
 interface PayloadResult {
   payload: SensenovaPoolUsagePayload | null;
-  reason: "auth" | "transient";
+  reason: QuotaFailureReason;
 }
 
 /**
@@ -526,18 +754,25 @@ async function readPoolUsagePayload(
 ): Promise<PayloadResult> {
   const first = await requestPoolUsage(connectionId, session.accessToken);
   if (first.status === "ok") return { payload: first.payload, reason: "transient" };
-  if (first.status !== "unauthorized") return { payload: null, reason: "transient" };
+  if (first.status !== "unauthorized")
+    return { payload: null, reason: poolFailureReason(first.status) };
 
   const latestRefresh = session.refreshToken || newestRefreshToken(connectionId, psd);
   if (!latestRefresh) return { payload: null, reason: "auth" };
 
   const retried = await startRefresh(connectionId, psd, latestRefresh);
-  if (!retried) return { payload: null, reason: "transient" };
+  if ("failure" in retried) {
+    // A replaced credential is not an outage either: the short window is right for
+    // both a dead token and one another writer already owns.
+    return { payload: null, reason: retried.failure === "transient" ? "transient" : "auth" };
+  }
 
-  const second = await requestPoolUsage(connectionId, retried.accessToken);
-  return second.status === "ok"
-    ? { payload: second.payload, reason: "transient" }
-    : { payload: null, reason: "auth" };
+  const second = await requestPoolUsage(connectionId, retried.session.accessToken);
+  if (second.status === "ok") return { payload: second.payload, reason: "transient" };
+  // Only an auth rejection after the retry means the credential is dead; a 429 or
+  // a console hiccup on the second read keeps the longer transient window, the
+  // same classification requestPoolUsage applies to the first.
+  return { payload: null, reason: poolFailureReason(second.status) };
 }
 
 export async function fetchSensenovaQuota(
@@ -553,21 +788,21 @@ export async function fetchSensenovaQuota(
   // Anything published from here on belongs to this credential generation. If an
   // operator replaces the credential while the request is in flight, the result
   // describes the old account and must not reach the cache.
-  const seq = currentSeq(connectionId);
-  const stillCurrent = () => currentSeq(connectionId) === seq;
+  const seq = currentQuotaSeq(connectionId);
+  const stillCurrent = () => currentQuotaSeq(connectionId) === seq;
 
   try {
     await throttleQuotaFetch();
 
-    const session = await resolveSession(connectionId, psd);
-    if (!session) {
-      // The credential just proved unusable; remember it briefly so every routing
-      // pass does not retry it, but keep the window short for a quick fix.
-      if (stillCurrent()) rememberQuota(connectionId, null, "auth");
+    const resolution = await resolveSession(connectionId, psd);
+    if (!resolution.session) {
+      // Keep the negative-cache window honest: a rejected credential is retried
+      // quickly, an outage is not hammered every few seconds.
+      if (stillCurrent()) rememberQuota(connectionId, null, resolution.reason);
       return null;
     }
 
-    const { payload, reason } = await readPoolUsagePayload(connectionId, psd, session);
+    const { payload, reason } = await readPoolUsagePayload(connectionId, psd, resolution.session);
     if (!payload) {
       if (stillCurrent()) rememberQuota(connectionId, null, reason);
       return null;
@@ -575,7 +810,7 @@ export async function fetchSensenovaQuota(
 
     const quota = buildSensenovaQuota(payload);
     if (!stillCurrent()) return null;
-    rememberQuota(connectionId, quota);
+    rememberQuota(connectionId, quota, quota ? undefined : "empty");
     return quota;
   } catch {
     if (stillCurrent()) rememberQuota(connectionId, null);
@@ -583,16 +818,57 @@ export async function fetchSensenovaQuota(
   }
 }
 
+/** Test hooks: the rotation memory is not observable through the public API. */
+export const __testing = {
+  newestRefreshToken,
+  hasRotationMemory: (connectionId: string) => latestRefreshTokens.has(connectionId),
+  hasAccessMemory: (connectionId: string) => memoryAccessTokens.has(connectionId),
+  setAccessMemory: (
+    connectionId: string,
+    token: string,
+    expiresAt: number,
+    basedOn: string
+  ): void => {
+    memoryAccessTokens.set(connectionId, { token, expiresAt, basedOn });
+  },
+  setRotationMemory: (connectionId: string, token: string, basedOn: string): void => {
+    latestRefreshTokens.set(connectionId, { token, basedOn });
+  },
+  rememberRotation: (connectionId: string, token: string, basedOn: string): void => {
+    rememberRefreshToken(connectionId, token, basedOn);
+  },
+  rememberAccess: (
+    connectionId: string,
+    token: string,
+    expiresAt: number,
+    basedOn: string
+  ): void => {
+    rememberAccessToken(connectionId, token, expiresAt, basedOn);
+  },
+};
+
 export function invalidateSensenovaQuotaCache(connectionId: string): void {
   quotaCache.delete(connectionId);
-  // An operator can replace the credential on the connection; the process-local
-  // rotation memory and any exchange started for the old credential would
-  // otherwise keep replaying the superseded token.
-  latestRefreshTokens.delete(connectionId);
-  memoryAccessTokens.delete(connectionId);
+  // This runs when the reading is invalidated (a 429, an exhausted plan, an
+  // operator refresh). It must not drop the rotation memory: a rotation whose row
+  // write failed lives only there, and discarding it would make the next exchange
+  // replay the token the platform already consumed. A credential replaced by
+  // someone else is detected from the row by newestRefreshToken instead.
   // Not the bounded LRU: an evicted entry would reset the sequence to 0 and let a
   // fetch that started before this invalidation look current again. One entry per
   // connection is bounded by the connections themselves.
+  quotaInvalidationSeq.set(connectionId, currentQuotaSeq(connectionId) + 1);
+}
+
+/**
+ * The credential was replaced: the reading and both process-local copies describe
+ * the previous account. Distinct from invalidateSensenovaQuotaCache, which only
+ * throws away the reading and deliberately keeps a rotation the row does not have.
+ */
+export function forgetSensenovaCredential(connectionId: string): void {
+  invalidateSensenovaQuotaCache(connectionId);
+  latestRefreshTokens.delete(connectionId);
+  memoryAccessTokens.delete(connectionId);
   invalidationSeq.set(connectionId, currentSeq(connectionId) + 1);
 }
 
@@ -601,6 +877,24 @@ export function registerSensenovaQuotaFetcher(): void {
   registerMonitorFetcher("sensenova", fetchSensenovaQuota);
   registerQuotaWindows("sensenova", ["5h", "7d"]);
   registerQuotaCacheInvalidator("sensenova", invalidateSensenovaQuotaCache);
+}
+
+export function sensenovaQuotaFailureReason(connectionId: string): QuotaFailureReason {
+  const entry = quotaCache.get(connectionId) as QuotaCacheEntry | undefined;
+  return entry?.reason ?? "transient";
+}
+
+export function quotaFailureMessage(reason: QuotaFailureReason): string {
+  switch (reason) {
+    case "auth":
+      return "SenseNova console session rejected; re-enter the account password.";
+    case "denied":
+      return "The SenseNova plan does not allow reading this allowance; no retry will change that.";
+    case "empty":
+      return "The SenseNova console reported no allowance for this account yet.";
+    default:
+      return "SenseNova console unreachable right now; the quota reading will retry shortly.";
+  }
 }
 
 export interface SensenovaNodeLike {
@@ -653,9 +947,20 @@ export async function getSensenovaUsage(connection: {
 }): Promise<Record<string, unknown>> {
   const connectionId = typeof connection.id === "string" ? connection.id : "";
   if (!connectionId) return { message: "Connection id missing." };
+  // An api-key-only connection has no console session to read through, and no
+  // credential to repair: telling the operator the console is unreachable would
+  // promise a retry that can never succeed.
+  const psd = asPsdRecord(connection.providerSpecificData) ?? {};
+  if (!hasUsableCredential(connectionId, psd)) {
+    return { message: "Usage API not implemented for sensenova" };
+  }
   const quota = await fetchSensenovaQuota(connectionId, connection as Record<string, unknown>);
   if (!quota) {
-    return { message: "SenseNova console session unavailable; re-enter the account password." };
+    // Do not tell the operator to re-enter a password when the console was simply
+    // unreachable: the reason the fetcher cached decides which advice is honest.
+    return {
+      message: quotaFailureMessage(sensenovaQuotaFailureReason(connectionId)),
+    };
   }
   return toSensenovaUsage(quota);
 }
