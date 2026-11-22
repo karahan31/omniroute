@@ -44,7 +44,7 @@ import { getCursorUsage } from "./usage/cursor.ts";
 import { getKimiUsage } from "./usage/kimi.ts";
 import { getCodexUsage } from "./usage/codex.ts";
 import { getClaudeUsage, getClaudePlanLabel } from "./usage/claude.ts";
-import { getKiroUsage, buildKiroUsageResult, discoverKiroProfileArn } from "./usage/kiro.ts";
+import { getKiroUsage } from "./usage/kiro.ts";
 // Re-exported para os testes kiro-* (importam de services/usage).
 export { buildKiroUsageResult, discoverKiroProfileArn } from "./usage/kiro.ts";
 import { getAdobeFireflyUsage } from "./usage/adobeFirefly.ts";
@@ -83,6 +83,7 @@ import { getXiaomiMimoUsage } from "./usage/xiaomi-mimo.ts";
 import { getXaiUsage } from "./usage/xai.ts";
 import { getXaiOauthUsage } from "./usage/xaiOauth.ts";
 import { getGrokCliUsage } from "./usage/grokCli.ts";
+import { getGrokBotUsage } from "./usage/grokBot.ts";
 import { getFirecrawlUsage } from "./usage/firecrawl.ts";
 import { getContext7Usage } from "./usage/context7.ts";
 import { getTavilyUsage } from "./usage/tavily.ts";
@@ -135,7 +136,7 @@ export async function getUsageForProvider(
   connection: UsageProviderConnection,
   options: { forceRefresh?: boolean; includePlan?: boolean } = {}
 ) {
-  const { id, provider, accessToken, apiKey, providerSpecificData, projectId, email } = connection;
+  const { id, provider, accessToken, apiKey, providerSpecificData, projectId } = connection;
 
   if (isKimiCodingConnection(connection)) {
     return await getKimiUsage(accessToken, apiKey, providerSpecificData, options);
@@ -254,6 +255,8 @@ export async function getUsageForProvider(
       return await getXaiOauthUsage(id || "", accessToken, connection);
     case "grok-cli":
       return await getGrokCliUsage(accessToken);
+    case "grok-bot":
+      return await getGrokBotUsage(accessToken);
     case "codebuddy-cn":
       return await getCodeBuddyCnUsage(accessToken, apiKey, providerSpecificData);
     case "codebuddy-intl":
