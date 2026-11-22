@@ -4,6 +4,7 @@ import { FAL_NATIVE_ENABLED_FLAG } from "./featureFlagDefinitionsFal";
 import { PLUGIN_PERMISSION_MODEL_ENABLED_FLAG } from "./featureFlagDefinitionsPlugins";
 import { CODE_ASSIST_LEGACY_TIER_FLAG } from "./featureFlagDefinitionsCodeAssist";
 import { SYSTEM_ONE_FEATURE_FLAG_DEFINITIONS } from "./featureFlagDefinitionsSystemOne";
+import { ENV_ONLY_FEATURE_FLAG_DEFINITIONS } from "./featureFlagDefinitionsEnvOnly";
 import {
   PII_RESPONSE_SANITIZATION_MODE_FLAG,
   PII_REVERSIBLE_VAULT_FLAG,
@@ -135,17 +136,6 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
   },
   PLUGIN_PERMISSION_MODEL_ENABLED_FLAG,
   // ──────────────── Network (7) ────────────────
-  {
-    key: "ENABLE_TLS_FINGERPRINT",
-    label: "TLS Fingerprint",
-    description: "Enable TLS fingerprint stealth mode",
-    descriptionI18nKey: "featureFlagEnableTlsFingerprintDescription",
-    category: "network",
-    defaultValue: "false",
-    type: "boolean",
-    requiresRestart: true,
-    warningLevel: "info",
-  },
   {
     key: "AUDIO_REMOTE_PROVIDER_NODES",
     label: "Remote Audio Provider Nodes",
@@ -459,17 +449,6 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
     warningLevel: "caution",
   },
   {
-    key: "MITM_DISABLE_TLS_VERIFY",
-    label: "Disable TLS Verify (MITM)",
-    description: "Disable TLS certificate verification for MITM proxy",
-    descriptionI18nKey: "featureFlagMitmDisableTlsVerifyDescription",
-    category: "network",
-    defaultValue: "false",
-    type: "boolean",
-    requiresRestart: true,
-    warningLevel: "danger",
-  },
-  {
     key: "OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS",
     label: "Allow Private Provider URLs",
     description:
@@ -518,29 +497,6 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
     enumValues: ["fail_closed", "count_as_zero"],
     requiresRestart: false,
     warningLevel: "caution",
-  },
-  {
-    key: "TOOL_POLICY_MODE",
-    label: "Tool Policy Mode",
-    description: "Set the tool use policy enforcement mode",
-    descriptionI18nKey: "featureFlagToolPolicyModeDescription",
-    category: "policies",
-    defaultValue: "disabled",
-    type: "enum",
-    enumValues: ["disabled", "warn", "block"],
-    requiresRestart: false,
-    warningLevel: "info",
-  },
-  {
-    key: "RATE_LIMIT_AUTO_ENABLE",
-    label: "Rate Limit Auto-Enable",
-    description: "Automatically enable rate limiting based on usage patterns",
-    descriptionI18nKey: "featureFlagRateLimitAutoEnableDescription",
-    category: "policies",
-    defaultValue: "false",
-    type: "boolean",
-    requiresRestart: false,
-    warningLevel: "info",
   },
   {
     key: "DISABLE_CONTEXT_WINDOW_CHECKS",
@@ -652,62 +608,6 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
     type: "boolean",
     requiresRestart: false,
     warningLevel: "caution",
-  },
-  {
-    key: "OMNIROUTE_MCP_COMPRESS_DESCRIPTIONS",
-    label: "MCP Compress Descriptions",
-    description: "Compress MCP tool descriptions to reduce token usage",
-    descriptionI18nKey: "featureFlagOmnirouteMcpCompressDescriptionsDescription",
-    category: "runtime",
-    defaultValue: "false",
-    type: "boolean",
-    requiresRestart: false,
-    warningLevel: "info",
-  },
-  {
-    key: "OMNIROUTE_ENABLE_RUNTIME_BACKGROUND_TASKS",
-    label: "Runtime Background Tasks",
-    description: "Enable background task processing at runtime",
-    descriptionI18nKey: "featureFlagOmnirouteEnableRuntimeBackgroundTasksDescription",
-    category: "runtime",
-    defaultValue: "false",
-    type: "boolean",
-    requiresRestart: false,
-    warningLevel: "info",
-  },
-  {
-    key: "OMNIROUTE_DISABLE_BACKGROUND_SERVICES",
-    label: "Disable Background Services",
-    description: "Disable all background services (quota refresh, sync, etc)",
-    descriptionI18nKey: "featureFlagOmnirouteDisableBackgroundServicesDescription",
-    category: "runtime",
-    defaultValue: "false",
-    type: "boolean",
-    requiresRestart: true,
-    warningLevel: "caution",
-  },
-  {
-    key: "OMNIROUTE_RTK_TRUST_PROJECT_FILTERS",
-    label: "RTK Trust Project Filters",
-    description: "Trust project-level filters from RTK without validation",
-    descriptionI18nKey: "featureFlagOmnirouteRtkTrustProjectFiltersDescription",
-    category: "runtime",
-    defaultValue: "false",
-    type: "boolean",
-    requiresRestart: false,
-    warningLevel: "caution",
-  },
-  {
-    key: "OMNIROUTE_ENABLE_LIVE_WS",
-    label: "Live Dashboard WebSocket",
-    description:
-      "Start the real-time dashboard WebSocket server on import (port 20132, loopback-bound by default). Default: enabled. Set to '0' or 'false' to disable. LAN exposure requires LIVE_WS_HOST=0.0.0.0 + LIVE_WS_ALLOWED_ORIGINS.",
-    descriptionI18nKey: "featureFlagOmnirouteEnableLiveWsDescription",
-    category: "runtime",
-    defaultValue: "true",
-    type: "boolean",
-    requiresRestart: true,
-    warningLevel: "info",
   },
   {
     key: "OMNIROUTE_CODEX_WS_ENABLED",
@@ -1121,40 +1021,6 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
 
   // ──────────────── CLI (5) ────────────────
   {
-    key: "CLI_COMPAT_ALL",
-    label: "CLI Compat All",
-    description: "Enable compatibility mode for all CLI clients",
-    descriptionI18nKey: "featureFlagCliCompatAllDescription",
-    category: "cli",
-    defaultValue: "false",
-    type: "boolean",
-    requiresRestart: true,
-    warningLevel: "info",
-  },
-  {
-    key: "MODEL_ALIAS_COMPAT_ENABLED",
-    label: "Model Alias Compat",
-    description: "Enable model alias compatibility layer",
-    descriptionI18nKey: "featureFlagModelAliasCompatEnabledDescription",
-    category: "cli",
-    defaultValue: "false",
-    type: "boolean",
-    requiresRestart: false,
-    warningLevel: "info",
-  },
-  {
-    key: "PRICING_SYNC_ENABLED",
-    label: "Pricing Sync",
-    description:
-      "Enable automatic pricing data synchronization (requires the PRICING_SYNC_ENABLED environment variable to be set to true)",
-    descriptionI18nKey: "featureFlagPricingSyncEnabledDescription",
-    category: "cli",
-    defaultValue: "false",
-    type: "boolean",
-    requiresRestart: false,
-    warningLevel: "info",
-  },
-  {
     key: "OMNIROUTE_AUTO_SYNC_CODEX_PROFILES",
     label: "Auto-Sync Codex Profiles",
     description:
@@ -1180,39 +1046,6 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
   },
 
   // ──────────────── Health (3) ────────────────
-  {
-    key: "OMNIROUTE_DISABLE_LOCAL_HEALTHCHECK",
-    label: "Disable Local Health Check",
-    description: "Disable the local instance health check endpoint",
-    descriptionI18nKey: "featureFlagOmnirouteDisableLocalHealthcheckDescription",
-    category: "health",
-    defaultValue: "false",
-    type: "boolean",
-    requiresRestart: false,
-    warningLevel: "info",
-  },
-  {
-    key: "OMNIROUTE_DISABLE_TOKEN_HEALTHCHECK",
-    label: "Disable Token Health Check",
-    description: "Disable the token validation health check",
-    descriptionI18nKey: "featureFlagOmnirouteDisableTokenHealthcheckDescription",
-    category: "health",
-    defaultValue: "false",
-    type: "boolean",
-    requiresRestart: false,
-    warningLevel: "info",
-  },
-  {
-    key: "SKILLS_SANDBOX_NETWORK_ENABLED",
-    label: "Skills Sandbox Network",
-    description: "Enable network access in the skills sandbox environment",
-    descriptionI18nKey: "featureFlagSkillsSandboxNetworkEnabledDescription",
-    category: "health",
-    defaultValue: "false",
-    type: "boolean",
-    requiresRestart: false,
-    warningLevel: "caution",
-  },
   {
     key: "PROXY_HEALTH_BLOCKED_RESETS_STREAK",
     label: "Proxy Health: Refusal Resets Failure Streak",
@@ -1432,4 +1265,5 @@ export const FEATURE_FLAG_DEFINITIONS: FeatureFlagDefinition[] = [
   ...SEARCH_FEATURE_FLAG_DEFINITIONS,
   CODE_ASSIST_LEGACY_TIER_FLAG,
   ...SYSTEM_ONE_FEATURE_FLAG_DEFINITIONS,
+  ...ENV_ONLY_FEATURE_FLAG_DEFINITIONS,
 ];
